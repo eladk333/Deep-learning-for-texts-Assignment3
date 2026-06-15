@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import subprocess
+import configparser
+from pathlib import Path
+import litellm
+
+HISTORY_DIR = Path.home() / ".doit"
+HISTORY_FILE = HISTORY_DIR / "history.json"
+MEMORY_FILE = HISTORY_DIR / "memory.json"
+MAX_HISTORY = 10  # number of past turns to keep and include in the prompt
+
+
+def get_active_model() -> str:
+    """Reads the model name from ~/doit.cfg as required by the assignment."""
+    config_path = Path.home() / "doit.cfg"
+    model_name = "ollama/mistral:7b"  # Fallback default
+
+    if config_path.exists():
+        config = configparser.ConfigParser()
+        config.read(config_path)
+        if "Model" in config and "name" in config["Model"]:
+            model_name = config["Model"]["name"]
+
+    return model_name
+
+
+def load_history():
+    """Load past turns from ~/.doit/history.json. Returns a list of dicts."""
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def save_turn(entry: dict):
+    """Append a new turn to the history file, keeping only the last MAX_HISTORY entries."""
+    HISTORY_DIR.mkdir(exist_ok=True)
+    history = load_history()
+    history.append(entry)
+    history = history[-MAX_HISTORY:]
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def format_history_for_prompt(history: list) -> str:
+    """Render past turns as plain text to include in the system prompt."""
+    if not history:
+        return "(no previous turns)"
+
+    lines = []
+    for i, turn in enumerate(history, start=1):
+        lines.append(f"Turn {i}:")
+        lines.append(f'  User instruction: "{turn.get("instruction", "")}"')
+        lines.append(f'  Response type: {turn.get("type", "")}')
+        if turn.get("type") == "command":
+            lines.append(f'  Command run: {turn.get("command", "")}')
+            stdout = (turn.get("stdout") or "").strip()
+            stderr = (turn.get("stderr") or "").strip()
+            if stdout:
+                # truncate long output to keep the prompt manageable
+                truncated = stdout[:500]
+                lines.append(f'  Output: {truncated}')
+            if stderr:
+                lines.append(f'  Error output: {stderr[:300]}')
+        elif turn.get("content"):
+            lines.append(f'  Content: {turn.get("content", "")[:300]}')
+            if turn.get("suggested_command"):
+                lines.append(f'  Suggested command (not executed): {turn.get("suggested_command")}')
+    return "\n".join(lines)
+
+
+def load_memory() -> dict:
+    """Load persistent memories from ~/.doit/memory.json. Returns a dict of key -> value."""
+    if not MEMORY_FILE.exists():
+        return {}
+    try:
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_memory(memory: dict):
+    """Write the memory dict back to ~/.doit/memory.json."""
+    HISTORY_DIR.mkdir(exist_ok=True)
+    with open(MEMORY_FILE, "w") as f:
+        json.dump(memory, f, indent=2)
+
+
+def apply_memory_action(memory: dict, memory_action: dict):
+    """Apply a store/update/delete action to the memory dict and persist it."""
+    if not memory_action:
+        return memory
+
+    action = memory_action.get("action")
+    key = memory_action.get("key")
+    value = memory_action.get("value")
+
+    if not key:
+        return memory
+
+    if action in ("store", "update"):
+        memory[key] = value
+    elif action == "delete":
+        memory.pop(key, None)
+
+    save_memory(memory)
+    return memory
+
+
+def format_memory_for_prompt(memory: dict) -> str:
+    """Render stored memories as plain text to include in the system prompt."""
+    if not memory:
+        return "(no stored memories)"
+    lines = []
+    for key, value in memory.items():
+        lines.append(f'- {key}: {value}')
+    return "\n".join(lines)
+
+
+def is_dangerous(command: str, model_to_use: str):
+    """Ask the LLM whether a command modifies the filesystem/system state."""
+    safety_prompt = """
+    You are a safety classifier for shell commands.
+    Given a shell command, decide if it is SAFE (read-only, only displays
+    information, e.g. ls, grep, cat, find, ps, df, echo) or DANGEROUS
+    (modifies the filesystem or system state in any way: creates, deletes,
+    moves, renames, overwrites files/directories, changes permissions,
+    installs/removes packages, kills processes, modifies git history, etc.)
+
+    Respond ONLY with a JSON object:
+    {"dangerous": true or false, "explanation": "short plain-English explanation of what the command does"}
+
+    Respond strictly with raw JSON, no markdown.
+    """
+    response = litellm.completion(
+        model=model_to_use,
+        messages=[
+            {"role": "system", "content": safety_prompt},
+            {"role": "user", "content": command}
+        ],
+        response_format={"type": "json_object"}
+    )
+    raw = response.choices[0].message.content.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    parsed = json.loads(raw.strip())
+    return parsed.get("dangerous", True), parsed.get("explanation", "")
+
+
+def run_shell(command: str, shell: str = "/bin/bash"):
+    result = subprocess.run(
+        command,
+        shell=True,
+        executable=shell,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    return {
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "returncode": result.returncode,
+    }
+
+
+def call_llm(model_to_use: str, system_prompt: str, user_message: str):
+    """Call the LLM and return the parsed JSON response."""
+    response = litellm.completion(
+        model=model_to_use,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message}
+        ],
+        response_format={"type": "json_object"}
+    )
+
+    raw_content = response.choices[0].message.content.strip()
+
+    if raw_content.startswith("```json"):
+        raw_content = raw_content[7:]
+    if raw_content.startswith("```"):
+        raw_content = raw_content[3:]
+    if raw_content.endswith("```"):
+        raw_content = raw_content[:-3]
+
+    return json.loads(raw_content.strip())
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Error: Missing instruction.")
+        print("Usage: doit \"your instruction here\"")
+        sys.exit(1)
+
+    user_instruction = " ".join(sys.argv[1:])
+
+    history = load_history()
+    history_text = format_history_for_prompt(history)
+
+    memory = load_memory()
+    memory_text = format_memory_for_prompt(memory)
+
+    system_prompt = f"""
+    You are a command-line assistant that translates natural language into bash or zsh shell commands.
+    You must analyze the user's request and respond ONLY with a valid JSON object.
+    The JSON object must contain a "type" field and a "content" field, and optionally
+    an "options" field, a "suggested_command" field, or a "memory_action" field.
+
+    Rules for "type":
+    - "command": the request can be fulfilled with a safe bash/zsh shell command.
+      "content" is the shell command.
+    - "answer": the user is asking a conversational question, greeting you, asking
+      for a joke, OR asking "how do I do X" / a non-command question. "content" is
+      your reply text. If the answer to a "how do I..." question naturally involves
+      a shell command, ALSO include a "suggested_command" field with that command as
+      a string. Do not execute it yourself - just suggest it.
+    - "impossible": the user is asking for something a shell command cannot realistically
+      achieve. "content" explains why.
+    - "clarify": the request is genuinely ambiguous AND the different interpretations
+      would lead to meaningfully different commands (e.g. sorting by creation date vs
+      access date vs modification date, or an ambiguous target file/folder name).
+      "content" is the question to ask the user. Optionally include an "options" field:
+      a list of short strings representing the possible choices.
+      Do NOT use "clarify" for trivial wording differences that would produce the same
+      or near-identical command - only when the choice meaningfully changes the result.
+
+    Memory:
+    Separately from "type", the user may ask you to remember something about them
+    (a fact, preference, or location) that should persist across sessions - this is
+    different from conversation history, which is temporary. If the request includes
+    something worth remembering long-term (e.g. "this is my LLM class project folder",
+    "always ask me before sorting", "I changed my mind about the sort order, ask me
+    each time"), include a "memory_action" field:
+    {{"action": "store" | "update" | "delete", "key": "short_identifier", "value": "the fact to remember"}}
+    - Use "store" for a new memory, "update" to change an existing one (use the same
+      key as before if it exists in STORED MEMORIES below), and "delete" to remove one
+      the user no longer wants.
+    - A single request can BOTH perform an action (type "command", etc.) AND include a
+      memory_action - for example, "move to ~/school/llms/ass3, this is my class project
+      folder" should produce a "cd" command AND store a memory about that folder.
+    - Only include "memory_action" when the user is explicitly stating something to
+      remember, or asking to change/forget a previous memory. Do not invent memories.
+
+    The user's request may refer to previous turns (e.g. "them", "it", "now sort it",
+    "do that again", "I meant creation date", "modify it to do y", "execute it",
+    "run that command"). Use the conversation history below to resolve such references.
+    In particular, if a previous turn was an "answer" with a "suggested_command", and
+    the user now says something like "execute it", "run it", or "do that", treat that
+    suggested_command as the basis: either return it directly as type "command" (if
+    the user just wants to run it), or modify it first if the user asked for a change
+    (e.g. "modify it to do y" then "execute it").
+    If the request is self-contained and doesn't reference anything previous, ignore
+    the history.
+
+    Also use STORED MEMORIES below (separate from conversation history) to resolve
+    references to things the user has told you to remember, e.g. "go to my llm class
+    project" should resolve to a "cd" command using the remembered path, even with no
+    relevant conversation history.
+
+    --- STORED MEMORIES ---
+    {memory_text}
+    --- END STORED MEMORIES ---
+
+    --- CONVERSATION HISTORY (most recent last) ---
+    {history_text}
+    --- END HISTORY ---
+
+    Examples:
+    User: list files in documents
+    {{"type": "command", "content": "ls ~/Documents"}}
+
+    User: tell me a joke
+    {{"type": "answer", "content": "Why do programmers wear glasses? Because they can't C#."}}
+
+    User: how do I find all python files in this folder?
+    {{"type": "answer", "content": "You can use find to search for files by extension.", "suggested_command": "find . -name '*.py'"}}
+
+    User: list the files in my home folder sorted by date
+    {{"type": "clarify", "content": "Do you want to sort by:", "options": ["creation date", "access date", "modification date"]}}
+
+    User: move to ~/school/llms/ass3, this is my llm class project folder
+    {{"type": "command", "content": "cd ~/school/llms/ass3", "memory_action": {{"action": "store", "key": "llm_class_project_folder", "value": "~/school/llms/ass3"}}}}
+
+    Respond strictly with the raw JSON object. Do not include markdown formatting or backticks like ```json.
+    """
+
+    model_to_use = get_active_model()
+
+    try:
+        parsed_response = call_llm(model_to_use, system_prompt, user_instruction)
+    except json.JSONDecodeError:
+        print(f"Error: The local model ({model_to_use}) failed to output valid JSON.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error communicating with LLM: {str(e)}")
+        sys.exit(1)
+
+    response_type = parsed_response.get("type")
+    content = parsed_response.get("content")
+
+    # Apply any memory action from the initial response immediately
+    memory_action = parsed_response.get("memory_action")
+    if memory_action:
+        memory = apply_memory_action(memory, memory_action)
+
+    # Handle clarification: ask the user, then re-ask the LLM with the answer included
+    if response_type == "clarify":
+        print(content)
+        options = parsed_response.get("options")
+        if options:
+            for i, opt in enumerate(options, start=1):
+                print(f"{i}. {opt}")
+
+        answer = input("> ").strip()
+
+        if not answer:
+            print("No answer given, aborting.")
+            turn_record = {
+                "instruction": user_instruction,
+                "type": "clarify",
+                "content": content,
+                "clarification_answer": None,
+            }
+            save_turn(turn_record)
+            return
+
+        # If the user typed a number matching an option, use that option's text
+        if options:
+            try:
+                idx = int(answer)
+                if 1 <= idx <= len(options):
+                    answer = options[idx - 1]
+            except ValueError:
+                pass
+
+        follow_up = (
+            f'Original request: "{user_instruction}"\n'
+            f'Clarifying question asked: "{content}"\n'
+            f'User\'s answer: "{answer}"\n'
+            f"Now produce the final response for the original request, "
+            f"incorporating the user's answer. Do not ask another clarifying "
+            f"question for the same issue."
+        )
+
+        try:
+            parsed_response = call_llm(model_to_use, system_prompt, follow_up)
+        except Exception as e:
+            print(f"Error communicating with LLM: {str(e)}")
+            sys.exit(1)
+
+        response_type = parsed_response.get("type")
+        content = parsed_response.get("content")
+
+        memory_action = parsed_response.get("memory_action")
+        if memory_action:
+            memory = apply_memory_action(memory, memory_action)
+
+    turn_record = {
+        "instruction": user_instruction,
+        "type": response_type,
+        "content": content,
+    }
+    if memory_action:
+        turn_record["memory_action"] = memory_action
+
+    if response_type == "command":
+        print(content)
+        print()
+
+        try:
+            dangerous, explanation = is_dangerous(content, model_to_use)
+        except Exception:
+            dangerous, explanation = True, "(safety check failed; treating as dangerous)"
+
+        if dangerous:
+            print("This command may modify your filesystem.")
+            if explanation:
+                print(f"What it does: {explanation}")
+            answer = input("Proceed? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                turn_record["command"] = content
+                turn_record["stdout"] = ""
+                turn_record["stderr"] = "(aborted by user)"
+                save_turn(turn_record)
+                return
+
+        execution_result = run_shell(content)
+
+        if execution_result["stdout"]:
+            print(execution_result["stdout"].strip())
+        if execution_result["stderr"]:
+            print(execution_result["stderr"].strip(), file=sys.stderr)
+
+        turn_record["command"] = content
+        turn_record["stdout"] = execution_result["stdout"]
+        turn_record["stderr"] = execution_result["stderr"]
+
+    elif response_type in ["answer", "impossible"]:
+        print(content)
+        suggested_command = parsed_response.get("suggested_command")
+        if suggested_command:
+            print()
+            print(f"Suggested command (not executed): {suggested_command}")
+            turn_record["suggested_command"] = suggested_command
+
+    save_turn(turn_record)
+
+
+if __name__ == "__main__":
+    main()
