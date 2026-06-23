@@ -120,6 +120,60 @@ def format_memory_for_prompt(memory: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Project profile (.doit.md)
+# ---------------------------------------------------------------------------
+
+PROFILE_FILENAME = ".doit.md"
+
+
+def load_project_profile(cwd: str) -> str:
+    """Walk up from cwd looking for the nearest .doit.md file.
+
+    This mirrors .gitignore behaviour: a profile placed at a project root
+    automatically applies to all subdirectories without needing a copy in each.
+    Returns the file content, or an empty string if none is found.
+    """
+    for directory in [Path(cwd)] + list(Path(cwd).parents):
+        profile = directory / PROFILE_FILENAME
+        if profile.exists():
+            try:
+                content = profile.read_text().strip()
+                if content:
+                    return f"[from {profile}]\n{content}"
+            except OSError:
+                pass
+    return ""
+
+
+def apply_profile_action(cwd: str, profile_action: dict):
+    """Apply a set/append/delete action to .doit.md in the current directory.
+
+    Always operates on CWD — never on a parent directory's profile.
+    """
+    if not profile_action:
+        return
+
+    action = profile_action.get("action")
+    content = profile_action.get("content", "").strip()
+    profile_path = Path(cwd) / PROFILE_FILENAME
+
+    if action == "set":
+        profile_path.write_text(content + "\n")
+        print(f"[profile] Created/updated {profile_path}")
+    elif action == "append":
+        existing = profile_path.read_text() if profile_path.exists() else ""
+        with open(profile_path, "w") as f:
+            f.write(existing.rstrip() + "\n" + content + "\n")
+        print(f"[profile] Appended to {profile_path}")
+    elif action == "delete":
+        if profile_path.exists():
+            profile_path.unlink()
+            print(f"[profile] Deleted {profile_path}")
+        else:
+            print(f"[profile] No profile found at {profile_path}")
+
+
+# ---------------------------------------------------------------------------
 # Shell history (user awareness)
 # ---------------------------------------------------------------------------
 

@@ -72,12 +72,19 @@ def is_dangerous(command: str, model: str) -> tuple[bool, str]:
 
 def run_shell(command: str, shell: str = "/bin/bash") -> dict:
     """Execute command in the given shell; return stdout, stderr, returncode."""
+    import re as _re
+    if _re.match(r"^\s*doit(\s|$)", command):
+        return {
+            "stdout": "",
+            "stderr": "doit: refusing to run a recursive doit call.\n",
+            "returncode": 1,
+        }
     try:
         result = subprocess.run(
             [shell, "-c", command],
             text=True,
             capture_output=True,
-            timeout=20,
+            timeout=60,
         )
         return {
             "stdout": result.stdout,

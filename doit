@@ -24,6 +24,7 @@ from store import (
     load_memory, apply_memory_action,
     format_history_for_prompt, format_memory_for_prompt,
     load_shell_history, format_shell_history_for_prompt,
+    load_project_profile, apply_profile_action,
 )
 
 SYSTEM_PROMPT_TEMPLATE = """
@@ -49,6 +50,17 @@ Rules for "type":
   a list of short strings representing the possible choices.
   Do NOT use "clarify" for trivial wording differences that would produce the same
   or near-identical command - only when the choice meaningfully changes the result.
+
+Project profile:
+If the user asks to create, update, or delete a profile for the current project folder,
+include a "profile_action" field in your response:
+{{"action": "set" | "append" | "delete", "content": "the profile text"}}
+- "set": creates .doit.md in the current directory, or fully replaces it
+- "append": adds content to the existing .doit.md (creates it if missing)
+- "delete": removes .doit.md from the current directory
+"content" is required for "set" and "append", ignored for "delete".
+A response can include both a normal action (type/content) AND a profile_action.
+Only include "profile_action" when the user explicitly asks to create/update/delete a profile.
 
 Memory:
 Separately from "type", the user may ask you to remember something about them
@@ -81,6 +93,10 @@ answer questions like "summarize what I just did" or "why did that fail". The
 current working directory is shown at the top of that section — use it when
 the user refers to "here", "this folder", "this directory", etc.
 
+--- PROJECT PROFILE (current folder context) ---
+{project_profile}
+--- END PROJECT PROFILE ---
+
 --- STORED MEMORIES ---
 {memory_text}
 --- END STORED MEMORIES ---
@@ -109,15 +125,22 @@ User: list the files in my home folder sorted by date
 User: move to ~/school/llms/ass3, this is my llm class project folder
 {{"type": "command", "content": "cd ~/school/llms/ass3", "memory_action": {{"action": "store", "key": "llm_class_project_folder", "value": "~/school/llms/ass3"}}}}
 
+User: create a profile for this project, it's a Python deep learning project and we always use pytest
+{{"type": "answer", "content": "Profile created.", "profile_action": {{"action": "set", "content": "This is a Python deep learning project.\n- Always use pytest for testing\n- Prefer python3 over python"}}}}
+
+User: add to this project's profile that we never delete .py files
+{{"type": "answer", "content": "Added to profile.", "profile_action": {{"action": "append", "content": "- Never delete .py files without explicit confirmation"}}}}
+
 Respond strictly with the raw JSON object. Do not include markdown formatting or backticks.
 """
 
 
-def build_system_prompt(history: list, memory: dict, shell_history: list[str], cwd: str) -> str:
+def build_system_prompt(history: list, memory: dict, shell_history: list[str], cwd: str, project_profile: str) -> str:
     return SYSTEM_PROMPT_TEMPLATE.format(
         history_text=format_history_for_prompt(history),
         memory_text=format_memory_for_prompt(memory),
         shell_history_text=format_shell_history_for_prompt(shell_history, cwd),
+        project_profile=project_profile or "(no project profile found — user can create one with: doit \"create a profile for this project\")",
     )
 
 
@@ -161,7 +184,8 @@ def main():
     memory = load_memory()
     shell_history = load_shell_history()
     cwd = os.getcwd()
-    system_prompt = build_system_prompt(history, memory, shell_history, cwd)
+    project_profile = load_project_profile(cwd)
+    system_prompt = build_system_prompt(history, memory, shell_history, cwd, project_profile)
 
     # --- First LLM call ---
     try:
@@ -176,9 +200,12 @@ def main():
     response_type = parsed.get("type")
     content = parsed.get("content")
     memory_action = parsed.get("memory_action")
+    profile_action = parsed.get("profile_action")
 
     if memory_action:
         memory = apply_memory_action(memory, memory_action)
+    if profile_action:
+        apply_profile_action(cwd, profile_action)
 
     # --- Clarification loop ---
     if response_type == "clarify":
@@ -229,8 +256,11 @@ def main():
         response_type = parsed.get("type")
         content = parsed.get("content")
         memory_action = parsed.get("memory_action")
+        profile_action = parsed.get("profile_action")
         if memory_action:
             memory = apply_memory_action(memory, memory_action)
+        if profile_action:
+            apply_profile_action(cwd, profile_action)
 
     # --- Build turn record ---
     turn_record = {
