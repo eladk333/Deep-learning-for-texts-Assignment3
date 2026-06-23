@@ -6,20 +6,40 @@ import re
 from pathlib import Path
 
 HISTORY_DIR = Path.home() / ".doit"
-HISTORY_FILE = HISTORY_DIR / "history.json"
 MEMORY_FILE = HISTORY_DIR / "memory.json"
 MAX_HISTORY = 10
+
+
+def _history_file(session_id: str = None) -> Path:
+    """Return the history file path for the given session ID.
+
+    If session_id is None, uses $DOIT_SESSION_ID from the environment.
+    Each terminal window exports a unique DOIT_SESSION_ID (set in ~/.bashrc).
+    This keeps history from different windows isolated so that references like
+    "them" or "it" resolve against the correct window's context.
+    Memory is intentionally NOT session-scoped — it stays global.
+    """
+    sid = session_id or os.environ.get("DOIT_SESSION_ID", "default")
+    return HISTORY_DIR / f"history_{sid}.json"
 
 
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
 
-def load_history() -> list:
-    if not HISTORY_FILE.exists():
+def load_history(session_id: str = None) -> list:
+    """Load history for the current session, or a specific session if given.
+
+    Pass session_id to read from another window's history (e.g. via --session).
+    Writes always go to the current session regardless of what was read.
+    """
+    history_file = _history_file(session_id)
+    if not history_file.exists():
+        if session_id:
+            print(f"doit: no history found for session {session_id}")
         return []
     try:
-        with open(HISTORY_FILE) as f:
+        with open(history_file) as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return []
@@ -30,7 +50,7 @@ def save_turn(entry: dict):
     history = load_history()
     history.append(entry)
     history = history[-MAX_HISTORY:]
-    with open(HISTORY_FILE, "w") as f:
+    with open(_history_file(), "w") as f:
         json.dump(history, f, indent=2)
 
 

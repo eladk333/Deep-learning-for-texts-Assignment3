@@ -143,13 +143,21 @@ def main():
         default="/bin/bash",
         help="Shell to use for execution (default: /bin/bash)",
     )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help=(
+            "Load history from a specific session ID instead of the current one. "
+            "Useful for cross-window references. Writes still go to the current session."
+        ),
+    )
 
     args = parser.parse_args()
     user_instruction = " ".join(args.instruction)
     model = args.model or get_active_model()
     shell = args.shell
 
-    history = load_history()
+    history = load_history(args.session)
     memory = load_memory()
     shell_history = load_shell_history()
     cwd = os.getcwd()
